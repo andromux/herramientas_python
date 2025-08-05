@@ -1,0 +1,479 @@
+#!/bin/bash
+
+# YouTube Channel Auto Downloader CLI
+# Uso: ./ytdl-manager.sh [comando] [opciones]
+
+# Configuración
+CONFIG_DIR="$HOME/.idyt"
+LOG_FILE="$CONFIG_DIR/.idyt.log"
+CHANNELS_FILE="$CONFIG_DIR/channels.conf"
+DOWNLOADS_DIR="$HOME"
+
+# Colores para output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Crear directorios necesarios
+mkdir -p "$CONFIG_DIR"
+
+# Función para logging
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+# Función para mostrar ayuda
+show_help() {
+    cat << EOF
+${BLUE}YouTube Channel Auto Downloader CLI${NC}
+
+${YELLOW}USO:${NC}
+    $0 [comando] [opciones]
+
+${YELLOW}COMANDOS:${NC}
+    add <channel_url>           - Agregar canal para monitoreo
+    remove <channel_name>       - Remover canal del monitoreo
+    list                        - Listar canales monitoreados
+    check [channel_name]        - Verificar nuevos videos (todos los canales si no se especifica)
+    download [channel_name]     - Descargar último video (todos los canales si no se especifica)
+    status                      - Mostrar estado de descargas
+    history [channel_name]      - Mostrar historial de descargas
+    clean                       - Limpiar archivos temporales
+    update                      - Actualizar yt-dlp
+
+${YELLOW}OPCIONES:${NC}
+    -q, --quality <calidad>     - Especificar calidad (720p, 1080p, best, worst)
+    -f, --format <formato>      - Especificar formato (mp4, webm, mkv)
+    -a, --audio-only            - Descargar solo audio
+    --no-log                    - No escribir en log
+    -v, --verbose               - Salida detallada
+    -h, --help                  - Mostrar esta ayuda
+
+${YELLOW}EJEMPLOS:${NC}
+    $0 add https://youtube.com/@midudev
+    $0 check midudev
+    $0 download --quality 720p --format mp4
+    $0 history midudev
+
+${YELLOW}ARCHIVOS:${NC}
+    Config: $CONFIG_DIR/channels.conf
+    Log: $LOG_FILE
+    Downloads: $DOWNLOADS_DIR/[Canal_Name]/
+EOF
+}
+
+# Función para verificar dependencias
+check_dependencies() {
+    local missing=()
+    
+    if ! command -v yt-dlp &> /dev/null; then
+        missing+=("yt-dlp")
+    fi
+    
+    if ! command -v jq &> /dev/null; then
+        missing+=("jq")
+    fi
+    
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo -e "${RED}Error: Faltan dependencias: ${missing[*]}${NC}"
+        echo -e "${YELLOW}Instala con:${NC}"
+        echo "pkg install yt-dlp jq"
+        exit 1
+    fi
+}
+
+# Función para extraer nombre del canal de URL
+get_channel_name() {
+    local url="$1"
+    if [[ "$url" =~ @([^/]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    elif [[ "$url" =~ /c/([^/]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    elif [[ "$url" =~ /channel/([^/]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        echo "unknown_channel"
+    fi
+}
+
+# Función para agregar canal
+add_channel() {
+    local url="$1"
+    local channel_name=$(get_channel_name "$url")
+    
+    if [ -z "$url" ]; then
+        echo -e "${RED}Error: URL del canal requerida${NC}"
+        exit 1
+    fi
+    
+    # Verificar si el canal ya existe
+    if grep -q "^$channel_name:" "$CHANNELS_FILE" 2>/dev/null; then
+        echo -e "${YELLOW}Canal '$channel_name' ya está en la lista${NC}"
+        return
+    fi
+    
+    # Verificar que la URL sea válida
+    echo -e "${BLUE}Verificando canal...${NC}"
+    if ! yt-dlp --quiet --simulate --playlist-items 1 "$url" &>/dev/null; then
+        echo -e "${RED}Error: No se puede acceder al canal o URL inválida${NC}"
+        exit 1
+    fi
+    
+    # Agregar canal al archivo de configuración
+    echo "$channel_name:$url:" >> "$CHANNELS_FILE"
+    mkdir -p "$DOWNLOADS_DIR/$channel_name"
+    
+    echo -e "${GREEN}Canal '$channel_name' agregado exitosamente${NC}"
+    log "Canal agregado: $channel_name ($url)"
+}
+
+# Función para remover canal
+remove_channel() {
+    local channel_name="$1"
+    
+    if [ -z "$channel_name" ]; then
+        echo -e "${RED}Error: Nombre del canal requerido${NC}"
+        exit 1
+    fi
+    
+    if ! grep -q "^$channel_name:" "$CHANNELS_FILE" 2>/dev/null; then
+        echo -e "${RED}Error: Canal '$channel_name' no encontrado${NC}"
+        exit 1
+    fi
+    
+    # Remover del archivo de configuración
+    grep -v "^$channel_name:" "$CHANNELS_FILE" > "$CHANNELS_FILE.tmp" && mv "$CHANNELS_FILE.tmp" "$CHANNELS_FILE"
+    
+    echo -e "${GREEN}Canal '$channel_name' removido${NC}"
+    log "Canal removido: $channel_name"
+}
+
+# Función para listar canales
+list_channels() {
+    if [ ! -f "$CHANNELS_FILE" ] || [ ! -s "$CHANNELS_FILE" ]; then
+        echo -e "${YELLOW}No hay canales configurados${NC}"
+        return
+    fi
+    
+    echo -e "${BLUE}Canales monitoreados:${NC}"
+    echo "-------------------"
+    
+    while IFS=':' read -r channel_name url last_video_id; do
+        echo -e "${GREEN}Canal:${NC} $channel_name"
+        echo -e "${BLUE}URL:${NC} $url"
+        if [ -n "$last_video_id" ]; then
+            echo -e "${YELLOW}Último video descargado:${NC} $last_video_id"
+        else
+            echo -e "${YELLOW}Último video descargado:${NC} Ninguno"
+        fi
+        echo "-------------------"
+    done < "$CHANNELS_FILE"
+}
+
+# Función para obtener el último video de un canal
+get_latest_video() {
+    local url="$1"
+    local video_info
+    
+    video_info=$(yt-dlp --quiet --dump-json --playlist-items 1 "$url" 2>/dev/null | jq -r '{id: .id, title: .title, upload_date: .upload_date}')
+    
+    if [ -n "$video_info" ] && [ "$video_info" != "null" ]; then
+        echo "$video_info"
+    else
+        return 1
+    fi
+}
+
+# Función para verificar nuevos videos
+check_updates() {
+    local target_channel="$1"
+    local found_updates=false
+    
+    if [ ! -f "$CHANNELS_FILE" ] || [ ! -s "$CHANNELS_FILE" ]; then
+        echo -e "${YELLOW}No hay canales configurados${NC}"
+        return
+    fi
+    
+    while IFS=':' read -r channel_name url last_video_id; do
+        # Si se especifica un canal, solo verificar ese
+        if [ -n "$target_channel" ] && [ "$channel_name" != "$target_channel" ]; then
+            continue
+        fi
+        
+        echo -e "${BLUE}Verificando canal: $channel_name${NC}"
+        
+        local video_info=$(get_latest_video "$url")
+        if [ $? -eq 0 ]; then
+            local current_video_id=$(echo "$video_info" | jq -r '.id')
+            local video_title=$(echo "$video_info" | jq -r '.title')
+            local upload_date=$(echo "$video_info" | jq -r '.upload_date')
+            
+            if [ "$current_video_id" != "$last_video_id" ]; then
+                echo -e "${GREEN}¡Nuevo video encontrado!${NC}"
+                echo -e "${YELLOW}Título:${NC} $video_title"
+                echo -e "${YELLOW}ID:${NC} $current_video_id"
+                echo -e "${YELLOW}Fecha:${NC} $upload_date"
+                found_updates=true
+            else
+                echo -e "${BLUE}No hay videos nuevos${NC}"
+            fi
+        else
+            echo -e "${RED}Error al verificar canal: $channel_name${NC}"
+        fi
+        echo "---"
+    done < "$CHANNELS_FILE"
+    
+    if [ "$found_updates" = false ] && [ -z "$target_channel" ]; then
+        echo -e "${GREEN}Todos los canales están actualizados${NC}"
+    fi
+}
+
+# Función para descargar videos
+download_videos() {
+    local target_channel="$1"
+    local quality="${QUALITY:-best}"
+    local format="${FORMAT:-mp4}"
+    local audio_only="${AUDIO_ONLY:-false}"
+    
+    if [ ! -f "$CHANNELS_FILE" ] || [ ! -s "$CHANNELS_FILE" ]; then
+        echo -e "${YELLOW}No hay canales configurados${NC}"
+        return
+    fi
+    
+    local temp_file=$(mktemp)
+    
+    while IFS=':' read -r channel_name url last_video_id; do
+        # Si se especifica un canal, solo descargar de ese
+        if [ -n "$target_channel" ] && [ "$channel_name" != "$target_channel" ]; then
+            echo "$channel_name:$url:$last_video_id" >> "$temp_file"
+            continue
+        fi
+        
+        echo -e "${BLUE}Verificando canal: $channel_name${NC}"
+        
+        local video_info=$(get_latest_video "$url")
+        if [ $? -eq 0 ]; then
+            local current_video_id=$(echo "$video_info" | jq -r '.id')
+            local video_title=$(echo "$video_info" | jq -r '.title')
+            
+            if [ "$current_video_id" != "$last_video_id" ]; then
+                echo -e "${GREEN}Descargando: $video_title${NC}"
+                
+                local download_dir="$DOWNLOADS_DIR/$channel_name"
+                mkdir -p "$download_dir"
+                
+                # Construir comando de descarga
+                local cmd="yt-dlp"
+                
+                if [ "$audio_only" = "true" ]; then
+                    cmd="$cmd -x --audio-format mp3"
+                else
+                    case "$quality" in
+                        "720p")
+                            cmd="$cmd -f \"bestvideo[height<=720]+bestaudio/best[height<=720]\""
+                            ;;
+                        "1080p")
+                            cmd="$cmd -f \"bestvideo[height<=1080]+bestaudio/best[height<=1080]\""
+                            ;;
+                        "worst")
+                            cmd="$cmd -f worst"
+                            ;;
+                        *)
+                            cmd="$cmd -f \"bv*[ext=$format]+ba[ext=m4a]/b[ext=$format]\""
+                            ;;
+                    esac
+                fi
+                
+                cmd="$cmd -P \"$download_dir\" -o \"%(title)s.%(ext)s\" \"https://youtube.com/watch?v=$current_video_id\""
+                
+                if eval "$cmd"; then
+                    echo -e "${GREEN}Descarga completada: $video_title${NC}"
+                    log "Descargado: $channel_name - $video_title ($current_video_id)"
+                    echo "$channel_name:$url:$current_video_id" >> "$temp_file"
+                else
+                    echo -e "${RED}Error en la descarga: $video_title${NC}"
+                    log "Error descarga: $channel_name - $video_title ($current_video_id)"
+                    echo "$channel_name:$url:$last_video_id" >> "$temp_file"
+                fi
+            else
+                echo -e "${BLUE}No hay videos nuevos para descargar${NC}"
+                echo "$channel_name:$url:$last_video_id" >> "$temp_file"
+            fi
+        else
+            echo -e "${RED}Error al verificar canal: $channel_name${NC}"
+            echo "$channel_name:$url:$last_video_id" >> "$temp_file"
+        fi
+        echo "---"
+    done < "$CHANNELS_FILE"
+    
+    # Actualizar archivo de configuración
+    mv "$temp_file" "$CHANNELS_FILE"
+}
+
+# Función para mostrar historial
+show_history() {
+    local target_channel="$1"
+    
+    if [ ! -f "$LOG_FILE" ]; then
+        echo -e "${YELLOW}No hay historial de descargas${NC}"
+        return
+    fi
+    
+    echo -e "${BLUE}Historial de descargas:${NC}"
+    echo "====================="
+    
+    if [ -n "$target_channel" ]; then
+        grep "Descargado: $target_channel" "$LOG_FILE" | tail -20
+    else
+        grep "Descargado:" "$LOG_FILE" | tail -20
+    fi
+}
+
+# Función para mostrar estado
+show_status() {
+    echo -e "${BLUE}Estado del sistema:${NC}"
+    echo "==================="
+    
+    # Contar canales
+    local channel_count=0
+    if [ -f "$CHANNELS_FILE" ]; then
+        channel_count=$(wc -l < "$CHANNELS_FILE")
+    fi
+    echo -e "${GREEN}Canales monitoreados:${NC} $channel_count"
+    
+    # Contar descargas
+    local download_count=0
+    if [ -f "$LOG_FILE" ]; then
+        download_count=$(grep -c "Descargado:" "$LOG_FILE")
+    fi
+    echo -e "${GREEN}Videos descargados:${NC} $download_count"
+    
+    # Espacio usado
+    local total_size=0
+    for dir in "$DOWNLOADS_DIR"/*/; do
+        if [ -d "$dir" ]; then
+            local size=$(du -sh "$dir" 2>/dev/null | cut -f1)
+            echo -e "${YELLOW}Espacio usado en ${dir##*/}:${NC} $size"
+        fi
+    done
+    
+    # Última actividad
+    if [ -f "$LOG_FILE" ]; then
+        local last_activity=$(tail -1 "$LOG_FILE")
+        echo -e "${BLUE}Última actividad:${NC} $last_activity"
+    fi
+}
+
+# Función para limpiar archivos temporales
+clean_temp() {
+    echo -e "${BLUE}Limpiando archivos temporales...${NC}"
+    
+    # Limpiar archivos temporales de yt-dlp
+    find /tmp -name "yt-dlp*" -type f -delete 2>/dev/null
+    
+    # Rotar log si es muy grande (>10MB)
+    if [ -f "$LOG_FILE" ] && [ $(stat -c%s "$LOG_FILE") -gt 10485760 ]; then
+        tail -1000 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+        log "Log rotado - mantenidas últimas 1000 líneas"
+    fi
+    
+    echo -e "${GREEN}Limpieza completada${NC}"
+}
+
+# Función para actualizar yt-dlp
+update_ytdlp() {
+    echo -e "${BLUE}Actualizando yt-dlp...${NC}"
+    
+    if yt-dlp -U; then
+        echo -e "${GREEN}yt-dlp actualizado exitosamente${NC}"
+        log "yt-dlp actualizado"
+    else
+        echo -e "${RED}Error al actualizar yt-dlp${NC}"
+        echo -e "${YELLOW}Intenta: pip install -U yt-dlp${NC}"
+    fi
+}
+
+# Función principal
+main() {
+    check_dependencies
+    
+    local command="$1"
+    shift
+    
+    # Parsear opciones
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -q|--quality)
+                QUALITY="$2"
+                shift 2
+                ;;
+            -f|--format)
+                FORMAT="$2"
+                shift 2
+                ;;
+            -a|--audio-only)
+                AUDIO_ONLY="true"
+                shift
+                ;;
+            --no-log)
+                NO_LOG="true"
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE="true"
+                shift
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            *)
+                ARGS+=("$1")
+                shift
+                ;;
+        esac
+    done
+    
+    case "$command" in
+        "add")
+            add_channel "${ARGS[0]}"
+            ;;
+        "remove")
+            remove_channel "${ARGS[0]}"
+            ;;
+        "list")
+            list_channels
+            ;;
+        "check")
+            check_updates "${ARGS[0]}"
+            ;;
+        "download")
+            download_videos "${ARGS[0]}"
+            ;;
+        "status")
+            show_status
+            ;;
+        "history")
+            show_history "${ARGS[0]}"
+            ;;
+        "clean")
+            clean_temp
+            ;;
+        "update")
+            update_ytdlp
+            ;;
+        "")
+            show_help
+            ;;
+        *)
+            echo -e "${RED}Comando desconocido: $command${NC}"
+            echo -e "${YELLOW}Usa '$0 --help' para ver comandos disponibles${NC}"
+            exit 1
+            ;;
+    esac
+}
+
+# Ejecutar función principal con todos los argumentos
+main "$@"
